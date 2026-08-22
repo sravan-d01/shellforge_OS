@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <limits.h>
 
 #include <readline/history.h>
 #include <readline/readline.h>
@@ -8,156 +10,288 @@
 #include "lexer.h"
 #include "parser.h"
 #include "expand.h"
+#include "builtin.h"
 #include "history.h"
 
-static void print_commands(const command_list_t *commands)
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+
+/*
+ * ---------------------------------------------------------
+ * Shellforge string duplication
+ * ---------------------------------------------------------
+ *
+ * We use our own function instead of strdup() so that the
+ * program compiles cleanly with -std=c11.
+ */
+static char *forge_strdup(const char *text)
 {
-    printf("----------- PARSED COMMANDS -----------\n");
+    size_t length;
+    char *copy;
 
-    for (int i = 0; i < commands->count; i++)
-    {
-        const command_t *command = &commands->commands[i];
+    if (text == NULL)
+        return NULL;
 
-        printf("Command %d:\n", i);
+    length = strlen(text) + 1;
 
-        printf("  argc      : %d\n", command->argc);
+    copy = malloc(length);
 
-        printf("  argv      :");
+    if (copy == NULL)
+        return NULL;
 
-        for (int j = 0; j < command->argc; j++)
-        {
-            printf(" [%s]", command->argv[j]);
-        }
+    memcpy(copy, text, length);
 
-        printf("\n");
-
-        if (command->input_file != NULL)
-        {
-            printf("  input     : %s\n",
-                   command->input_file);
-        }
-        else
-        {
-            printf("  input     : none\n");
-        }
-
-        if (command->output_file != NULL)
-        {
-            printf("  output    : %s\n",
-                   command->output_file);
-
-            if (command->append)
-            {
-                printf("  mode      : append\n");
-            }
-            else
-            {
-                printf("  mode      : overwrite\n");
-            }
-        }
-        else
-        {
-            printf("  output    : none\n");
-        }
-
-        printf("  background: %s\n",
-               command->background ? "yes" : "no");
-    }
-
-    printf("---------------------------------------\n");
+    return copy;
 }
 
+
+/*
+ * ---------------------------------------------------------
+ * Shellforge prompt
+ * ---------------------------------------------------------
+ *
+ * The prompt displays the current working directory.
+ *
+ * Example:
+ *
+ *     forge@/root $
+ *     forge@/tmp $
+ *
+ */
+static char *shellforge_prompt(void)
+{
+    char cwd[PATH_MAX];
+    char prompt[PATH_MAX + 32];
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL)
+    {
+        return forge_strdup("forge@? $ ");
+    }
+
+    snprintf(
+        prompt,
+        sizeof(prompt),
+        "forge@%s $ ",
+        cwd
+    );
+
+    return forge_strdup(prompt);
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Shellforge banner
+ * ---------------------------------------------------------
+ */
+static void shellforge_banner(void)
+{
+    printf("\n");
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║            SHELLFORGE 3.1            ║\n");
+    printf("║       Interactive Builtin Core        ║\n");
+    printf("╚══════════════════════════════════════╝\n");
+    printf("\n");
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * Main Shell Loop
+ * ---------------------------------------------------------
+ */
 int main(void)
 {
-    printf("=====================================\n");
-    printf("         Shellforge\n");
-    printf(" A Unix Style Shell written in C\n");
-    printf("=====================================\n");
+    shellforge_banner();
 
     while (1)
     {
-        char *line = readline("shellforge$ ");
+        char *prompt;
+        char *line;
 
+        /*
+         * Build the prompt using the current directory.
+         */
+        prompt = shellforge_prompt();
+
+        if (prompt == NULL)
+        {
+            fprintf(
+                stderr,
+                "[SHELLFORGE] unable to create prompt\n"
+            );
+
+            return EXIT_FAILURE;
+        }
+
+        /*
+         * Read command from the user.
+         */
+        line = readline(prompt);
+
+        free(prompt);
+
+        /*
+         * Ctrl+D / EOF
+         */
         if (line == NULL)
         {
-            printf("\nGoodbye!\n");
+            printf("\n");
+            printf("[SHELLFORGE] input stream closed\n");
             break;
         }
 
-        if (strlen(line) == 0)
+        /*
+         * Ignore empty input.
+         */
+        if (line[0] == '\0')
         {
             free(line);
             continue;
         }
 
         /*
-         * Do not put "exit" into command history.
-         */
-        if (strcmp(line, "exit") == 0)
-        {
-            free(line);
-            printf("Exiting...\n");
-            break;
-        }
-
-        /*
-         * Do not put "history" itself into history.
-         */
-        if (strcmp(line, "history") == 0)
-        {
-            print_command_history();
-            free(line);
-            continue;
-        }
-
-        /*
-         * Save normal commands.
+         * Store command in readline history.
          */
         add_history(line);
 
+
         /*
-         * -----------------------------
+         * =================================================
          * LEXER
-         * -----------------------------
+         * =================================================
          */
         token_list_t tokens;
 
         lexer(line, &tokens);
 
-        /*
-         * Display tokens.
-         */
-        token_print(&tokens);
 
         /*
-         * -----------------------------
+         * =================================================
          * PARSER
-         * -----------------------------
+         * =================================================
          */
         command_list_t commands;
 
         parser(&tokens, &commands);
 
+
         /*
-         * -----------------------------
-         * EXPAND
-         * -----------------------------
+         * =================================================
+         * EXPANSION
+         * =================================================
+         *
+         * Example:
+         *
+         *     echo $HOME
+         *
+         * becomes:
+         *
+         *     echo /root
          */
         expand_commands(&commands);
 
-        /*
-         * Display parsed and expanded commands.
-         */
-        print_commands(&commands);
 
         /*
-         * Free dynamically allocated
-         * command information.
+         * Nothing was produced by the parser.
+         */
+        if (commands.count == 0)
+        {
+            command_list_free(&commands);
+            free(line);
+            continue;
+        }
+
+
+        /*
+         * =================================================
+         * BUILTIN DISPATCH
+         * =================================================
+         *
+         * Milestone 3.1 builtins:
+         *
+         *     pwd
+         *     cd
+         *     help
+         *     exit
+         *
+         */
+        for (int i = 0; i < commands.count; i++)
+        {
+            command_t *command;
+            builtin_result_t result;
+
+            command = &commands.commands[i];
+
+            /*
+             * Ignore empty command segments.
+             */
+            if (command->argc == 0)
+                continue;
+
+            /*
+             * Send command to builtin dispatcher.
+             */
+            result = builtin_execute(command);
+
+
+            /*
+             * -------------------------------------------------
+             * EXIT
+             * -------------------------------------------------
+             */
+            if (result == BUILTIN_EXIT)
+            {
+                command_list_free(&commands);
+                free(line);
+
+                printf("\n");
+                printf("[SHELLFORGE] session ended\n");
+
+                return EXIT_SUCCESS;
+            }
+
+
+            /*
+             * -------------------------------------------------
+             * UNKNOWN COMMAND
+             * -------------------------------------------------
+             *
+             * External command execution belongs to a later
+             * milestone.
+             */
+            if (result == BUILTIN_NOT_FOUND)
+            {
+                printf("\n");
+                printf("[FORGE] external command: %s\n",
+                       command->argv[0]);
+
+                printf(
+                    "[FORGE] execution engine is reserved "
+                    "for a later milestone.\n"
+                );
+            }
+        }
+
+
+        /*
+         * Free parser/expansion memory.
          */
         command_list_free(&commands);
 
+        /*
+         * Free readline input.
+         */
         free(line);
     }
 
-    return 0;
+
+    /*
+     * Normal termination through EOF.
+     */
+    printf("[SHELLFORGE] goodbye!\n");
+
+    return EXIT_SUCCESS;
 }
