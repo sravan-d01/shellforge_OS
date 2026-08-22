@@ -12,6 +12,7 @@
 #include "expand.h"
 #include "builtin.h"
 #include "history.h"
+#include "executor.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -254,25 +255,11 @@ int main(void)
             }
 
 
-            /*
-             * -------------------------------------------------
-             * UNKNOWN COMMAND
-             * -------------------------------------------------
-             *
-             * External command execution belongs to a later
-             * milestone.
-             */
             if (result == BUILTIN_NOT_FOUND)
-            {
-                printf("\n");
-                printf("[FORGE] external command: %s\n",
-                       command->argv[0]);
-
-                printf(
-                    "[FORGE] execution engine is reserved "
-                    "for a later milestone.\n"
-                );
-            }
+		{
+    			execute_commands(&commands);
+   			break;
+		}
         }
 
 
